@@ -19,6 +19,13 @@ html5lib Package
     :show-inheritance:
     :special-members: __init__
 
+``fragmentcontext`` Module
+--------------------------
+
+.. automodule:: html5lib.fragmentcontext
+    :members:
+    :show-inheritance:
+
 ``serializer`` Module
 ---------------------
 

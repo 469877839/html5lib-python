@@ -8,6 +8,12 @@ Unreleased yet
 
 Features:
 
+* ``parseFragment`` now accepts a
+  :class:`html5lib.fragmentcontext.FragmentContext` as its ``container``
+  argument.  It describes the context element's namespace, attributes and
+  ancestor chain explicitly, so SVG, MathML and table fragments can be parsed
+  without building a fake complete document.  The string container argument
+  keeps working as before.
 * Add support for the ``<wbr>`` element in the sanitizer, `which indicates
   a line break opportunity <https://html.spec.whatwg.org/#the-wbr-element>`_.
   This element is allowed by default. (#395) (Thank you, Tom Most!)

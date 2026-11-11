@@ -138,7 +138,9 @@ def getETreeBuilder(ElementTreeImplementation, fullTree=False):
 
         def reparentChildren(self, newParent):
             if newParent.childNodes:
-                newParent.childNodes[-1]._element.tail += self._element.text
+                if self._element.text:
+                    lastChild = newParent.childNodes[-1]._element
+                    lastChild.tail = (lastChild.tail or "") + self._element.text
             else:
                 if not newParent._element.text:
                     newParent._element.text = ""

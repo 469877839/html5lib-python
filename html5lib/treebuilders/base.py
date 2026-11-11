@@ -190,6 +190,9 @@ class TreeBuilder(object):
         self.headPointer = None
         self.formPointer = None
 
+        # Detached nodes describing the context of a fragment parse
+        self.fragmentContextNodes = []
+
         self.insertFromTable = False
 
         self.document = self.documentClass()
@@ -263,6 +266,8 @@ class TreeBuilder(object):
                 break
 
     def clearActiveFormattingElements(self):
+        if not self.activeFormattingElements:
+            return
         entry = self.activeFormattingElements.pop()
         while self.activeFormattingElements and entry != Marker:
             entry = self.activeFormattingElements.pop()
@@ -401,6 +406,25 @@ class TreeBuilder(object):
     def getDocument(self):
         """Return the final tree"""
         return self.document
+
+    def detachFragmentContext(self):
+        """Fold the detached fragment context nodes back into the html root.
+
+        The context element and its ancestors are only pushed onto the stack
+        of open elements; they are never attached to the output tree.  Parsed
+        nodes can nevertheless end up as children of the context element
+        (including foster-parented content), so move everything below the html
+        root back onto it before extracting the fragment.
+        """
+        if not self.fragmentContextNodes or not self.openElements:
+            self.fragmentContextNodes = []
+            return
+        root = self.openElements[0]
+        for node in reversed(self.fragmentContextNodes):
+            node.reparentChildren(root)
+        self.fragmentContextNodes = []
+        if self.formPointer is not None and self.formPointer not in self.openElements:
+            self.formPointer = None
 
     def getFragment(self):
         """Return the final fragment"""

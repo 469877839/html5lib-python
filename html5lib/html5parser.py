@@ -4,6 +4,8 @@ from six import viewkeys
 from . import _inputstream
 from . import _tokenizer
 
+from .fragmentcontext import FragmentContext
+
 from . import treebuilders
 from .treebuilders.base import Marker
 
@@ -49,7 +51,10 @@ def parseFragment(doc, container="div", treebuilder="etree", namespaceHTMLElemen
 
     :arg doc: the fragment to parse as a string or file-like object
 
-    :arg container: the container context to parse the fragment in
+    :arg container: the container context to parse the fragment in; either
+        the name of the element whose ``innerHTML`` is being parsed or a
+        :class:`html5lib.fragmentcontext.FragmentContext` describing the
+        context element (namespace, attributes and ancestor chain) in full
 
     :arg treebuilder: the treebuilder to use when parsing
 
@@ -114,6 +119,11 @@ class HTMLParser(object):
     def _parse(self, stream, innerHTML=False, container="div", scripting=False, **kwargs):
 
         self.innerHTMLMode = innerHTML
+        if innerHTML:
+            if container is None:
+                container = "div"
+            if not isinstance(container, FragmentContext):
+                container = FragmentContext(container)
         self.container = container
         self.scripting = scripting
         self.tokenizer = _tokenizer.HTMLTokenizer(stream, parser=self, **kwargs)
@@ -134,20 +144,39 @@ class HTMLParser(object):
         self.compatMode = "no quirks"
 
         if self.innerHTMLMode:
-            self.innerHTML = self.container.lower()
+            context = self.container
+            self.innerHTML = context.name
 
-            if self.innerHTML in cdataElements:
-                self.tokenizer.state = self.tokenizer.rcdataState
-            elif self.innerHTML in rcdataElements:
-                self.tokenizer.state = self.tokenizer.rawtextState
-            elif self.innerHTML == 'plaintext':
-                self.tokenizer.state = self.tokenizer.plaintextState
-            else:
-                # state already is data state
-                # self.tokenizer.state = self.tokenizer.dataState
-                pass
+            self.tokenizer.state = {
+                "rcdata": self.tokenizer.rcdataState,
+                "rawtext": self.tokenizer.rawtextState,
+                "plaintext": self.tokenizer.plaintextState,
+                "data": self.tokenizer.dataState,
+            }[context.initialTokenizerState(self.scripting)]
+
             self.phase = self.phases["beforeHtml"]
             self.phase.insertHtmlElement()
+
+            # Push detached copies of the context's ancestor chain and the
+            # context element itself.  They are not part of the output tree,
+            # and the copies keep the caller's FragmentContext untouched.
+            for element in context.chain:
+                if element.namespace == namespaces["html"]:
+                    nodeNamespace = self.tree.defaultNamespace
+                else:
+                    nodeNamespace = element.namespace
+                node = self.tree.createElement({
+                    "name": element.name,
+                    "namespace": nodeNamespace,
+                    "data": dict(element.attributes),
+                })
+                node._flags.append("fragment-context")
+                self.tree.fragmentContextNodes.append(node)
+                self.tree.openElements.append(node)
+
+            if context.isFormContext():
+                self.tree.formPointer = self.tree.openElements[-1]
+
             self.resetInsertionMode()
         else:
             self.innerHTML = False  # pylint:disable=redefined-variable-type
@@ -255,6 +284,12 @@ class HTMLParser(object):
                                 {"name": prev_token["name"]})
 
         # When the loop finishes it's EOF
+        if self.innerHTMLMode:
+            # The fragment context nodes only modelled the context element
+            # and its ancestors; remove them so EOF handling sees the same
+            # stack the fragment parsing algorithm would.
+            self.tree.openElements = [node for node in self.tree.openElements
+                                      if "fragment-context" not in node._flags]
         reprocess = True
         phases = []
         while reprocess:
@@ -291,8 +326,11 @@ class HTMLParser(object):
     def parseFragment(self, stream, *args, **kwargs):
         """Parse a HTML fragment into a well-formed tree fragment
 
-        :arg container: name of the element we're setting the innerHTML
-            property if set to None, default to 'div'
+        :arg container: either the name (as a string) of the element whose
+            ``innerHTML`` is being parsed, defaulting to ``'div'`` when
+            :obj:`None`, or a
+            :class:`html5lib.fragmentcontext.FragmentContext` describing the
+            context element's namespace, attributes and ancestor chain
 
         :arg stream: a file-like object or string containing the HTML to be parsed
 
@@ -314,6 +352,7 @@ class HTMLParser(object):
 
         """
         self._parse(stream, True, *args, **kwargs)
+        self.tree.detachFragmentContext()
         return self.tree.getFragment()
 
     def parseError(self, errorcode="XXX-undefined-error", datavars=None):
@@ -340,7 +379,6 @@ class HTMLParser(object):
     def resetInsertionMode(self):
         # The name of this method is mostly historical. (It's also used in the
         # specification.)
-        last = False
         newModes = {
             "select": "inSelect",
             "td": "inCell",
@@ -357,13 +395,16 @@ class HTMLParser(object):
             "frameset": "inFrameset",
             "html": "beforeHead"
         }
-        for node in self.tree.openElements[::-1]:
+        # In fragment mode the root html element is a stand-in for the
+        # document; the walk starts with the context element (and its
+        # ancestors), mirroring the fragment parsing algorithm.
+        if self.innerHTML:
+            nodes = self.tree.openElements[1:]
+        else:
+            nodes = self.tree.openElements
+        for index, node in enumerate(nodes[::-1]):
             nodeName = node.name
-            new_phase = None
-            if node == self.tree.openElements[0]:
-                assert self.innerHTML
-                last = True
-                nodeName = self.innerHTML
+            last = index == len(nodes) - 1
             # Check for conditions that should only happen in the innerHTML
             # case
             if nodeName in ("select", "colgroup", "head", "html"):
