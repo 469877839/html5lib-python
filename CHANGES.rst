@@ -18,6 +18,14 @@ Features:
 
 Bug fixes:
 
+* The HTML serializer now writes namespaced foreign attributes back using
+  their HTML qualified names (e.g. ``xlink:href``, ``xml:lang``,
+  ``xmlns:xlink``) instead of silently dropping the namespace. Elements in
+  element namespaces, and attributes in attribute namespaces, that HTML text
+  cannot express are reported through ``HTMLSerializer.errors`` rather than
+  silently rewritten.
+* The DOM tree walker now uses ``localName`` for namespaced elements so a
+  namespace prefix is not mistaken for part of the tag name.
 * The sanitizer now permits ``<summary>`` tags. It used to allow ``<details>``
   already. (#423)
 

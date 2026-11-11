@@ -86,6 +86,44 @@ The serializer lets you write HTML back as a stream of bytes.
 You can customize the serializer behaviour in a variety of ways. Consult
 the :class:`~html5lib.serializer.HTMLSerializer` documentation.
 
+Round-tripping foreign content
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+HTML text only has names for the HTML, SVG and MathML element namespaces and
+for a fixed set of namespaced attributes (the ``xlink:``, ``xml:`` and
+``xmlns`` attributes defined by the HTML spec).  The following structures are
+serialized to HTML text that the parser turns back into an identical logical
+tree (element and attribute namespace URIs preserved):
+
+* HTML inside SVG ``foreignObject`` and inside MathML integration points
+  such as ``mi``, ``mtext`` and ``annotation-xml``;
+* elements that share a local name between HTML and foreign content
+  (``a``, ``script``, ``style``, ``title``);
+* the HTML spellings of foreign attributes, e.g. ``xlink:href``,
+  ``xml:lang`` and ``xmlns:xlink``;
+* SVG/MathML case rules (``linearGradient``, ``gradientUnits``, ...);
+* comments, character references and raw text in ``script``, ``style``,
+  ``textarea`` and ``title``.
+
+The regression matrix exercising these cases lives in
+``html5lib/tests/test_roundtrip.py``.  It compares tree-walker tokens
+(namespace URI and local name) rather than raw ElementTree output, so it does
+not depend on the temporary namespace prefixes an XML serializer might invent.
+
+Trees that HTML text cannot express are not silently rewritten.  Instead a
+message is appended to :attr:`HTMLSerializer.errors`; setting
+``serializer.strict = True`` turns the message into a
+:class:`~html5lib.serializer.SerializeError`.  These cases include:
+
+* elements in a namespace other than HTML, SVG or MathML (they would be
+  re-parsed into the HTML namespace);
+* attributes in a namespace without an HTML qualified name (only the spec's
+  foreign attribute adjustments have one).
+
+Other conservative diagnostics that do not lose information are also
+recorded: ``--`` inside a comment, ``</`` inside raw text elements, and child
+elements inside a raw text element.
+
 
 Filters
 ~~~~~~~

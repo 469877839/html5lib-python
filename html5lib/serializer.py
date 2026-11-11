@@ -7,6 +7,7 @@ from codecs import register_error, xmlcharrefreplace_errors
 
 from .constants import voidElements, booleanAttributes, spaceCharacters
 from .constants import rcdataElements, entities, xmlEntities
+from .constants import namespaces, unadjustForeignAttributes
 from . import treewalkers, _utils
 from xml.sax.saxutils import escape
 
@@ -21,6 +22,13 @@ _quoteAttributeLegacy = re.compile("[" + _quoteAttributeSpecChars +
                                    "\u2008\u2009\u200a\u2028\u2029\u202f\u205f"
                                    "\u3000]")
 
+
+# Namespaces whose elements HTML text can express; elements in any other
+# namespace would be silently re-parsed into the HTML namespace, so they are
+# diagnosed rather than rewritten.
+_expressibleElementNamespaces = frozenset([None, namespaces["html"],
+                                           namespaces["svg"],
+                                           namespaces["mathml"]])
 
 _encode_entity_map = {}
 _is_ucs4 = len("\U0010FFFF") == 1
@@ -293,14 +301,32 @@ class HTMLSerializer(object):
 
             elif type in ("StartTag", "EmptyTag"):
                 name = token["name"]
+                namespace = token.get("namespace")
+                if namespace not in _expressibleElementNamespaces:
+                    self.serializeError(
+                        "Cannot serialize element %s in namespace %s to HTML"
+                        % (name, namespace))
                 yield self.encodeStrict("<%s" % name)
                 if name in rcdataElements and not self.escape_rcdata:
                     in_cdata = True
                 elif in_cdata:
                     self.serializeError("Unexpected child element of a CDATA element")
-                for (_, attr_name), attr_value in token["data"].items():
-                    # TODO: Add namespace support here
-                    k = attr_name
+                for (attr_namespace, attr_name), attr_value in token["data"].items():
+                    if attr_namespace is None:
+                        k = attr_name
+                    else:
+                        # Namespaced attributes can only be round-tripped when
+                        # HTML defines a qualified name for them (e.g.
+                        # xlink:href, xml:lang); anything else has no HTML
+                        # spelling and is diagnosed instead of silently losing
+                        # the namespace.
+                        k = unadjustForeignAttributes.get((attr_namespace,
+                                                           attr_name))
+                        if k is None:
+                            self.serializeError(
+                                "Cannot serialize attribute %s in namespace %s to HTML"
+                                % (attr_name, attr_namespace))
+                            k = attr_name
                     v = attr_value
                     yield self.encodeStrict(' ')
 

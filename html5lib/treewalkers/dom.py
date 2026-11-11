@@ -21,7 +21,11 @@ class TreeWalker(base.NonRecursiveTreeWalker):
                     attrs[(attr.namespaceURI, attr.localName)] = attr.value
                 else:
                     attrs[(None, attr.name)] = attr.value
-            return (base.ELEMENT, node.namespaceURI, node.nodeName,
+            # Prefer localName over nodeName so that a prefix on a
+            # namespaced element (e.g. "svg:rect") is not mistaken for
+            # part of the tag name.
+            name = node.localName if node.namespaceURI else node.nodeName
+            return (base.ELEMENT, node.namespaceURI, name,
                     attrs, node.hasChildNodes())
 
         elif node.nodeType == Node.COMMENT_NODE:
