@@ -119,12 +119,71 @@ class Node(object):
         raise NotImplementedError
 
 
+class WorkCounter(object):
+    """Counters for the linear scans the tree construction algorithm does.
+
+    Every counter records work done on an actual data structure (the stack
+    of open elements or the list of active formatting elements), never wall
+    clock time. The counters are only updated when a WorkCounter instance is
+    attached to a tree builder; otherwise parsing runs without any extra
+    bookkeeping.
+    """
+
+    __slots__ = ("scope_probes", "stack_contains", "stack_index",
+                 "stack_remove", "afe_probes", "afe_index", "afe_contains",
+                 "afe_remove", "foster_probes", "agency_probes",
+                 "stack_snapshot")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        # Element comparisons performed while walking the stack of open
+        # elements backwards to determine scope.
+        self.scope_probes = 0
+        # Element comparisons performed by membership tests
+        # (``element in openElements``) and by index lookups / removals on
+        # the stack of open elements.
+        self.stack_contains = 0
+        self.stack_index = 0
+        self.stack_remove = 0
+        # Element comparisons performed while walking the list of active
+        # formatting elements, plus its membership, index and removal work.
+        self.afe_probes = 0
+        self.afe_index = 0
+        self.afe_contains = 0
+        self.afe_remove = 0
+        # Element comparisons performed while searching the stack for the
+        # most recently opened table (foster parent positioning).
+        self.foster_probes = 0
+        # Element comparisons performed by the adoption agency algorithm
+        # while walking the stack of open elements.
+        self.agency_probes = 0
+        # Elements included in a one-shot identity snapshot of the stack of
+        # open elements, used to answer several membership questions without
+        # rescanning the stack once per active formatting element.
+        self.stack_snapshot = 0
+
+    def as_dict(self):
+        return dict((name, getattr(self, name)) for name in self.__slots__)
+
+    @property
+    def total(self):
+        return sum(getattr(self, name) for name in self.__slots__)
+
+
 class ActiveFormattingElements(list):
+    def __init__(self, work=None):
+        super(ActiveFormattingElements, self).__init__()
+        self._work = work
+
     def append(self, node):
         """Append node to the end of the list."""
         equalCount = 0
         if node != Marker:
             for element in self[::-1]:
+                if self._work is not None:
+                    self._work.afe_probes += 1
                 if element == Marker:
                     break
                 if self.nodesEqual(element, node):
@@ -142,6 +201,15 @@ class ActiveFormattingElements(list):
             return False
 
         return True
+
+    def appendChecked(self, node):
+        """Append a node whose Noah's Ark clause check has already run.
+
+        Callers that already scanned the list for equal elements (e.g. the
+        tree construction algorithm before inserting a formatting element)
+        can use this to avoid scanning the list a second time.
+        """
+        list.append(self, node)
 
 
 class TreeBuilder(object):
@@ -180,11 +248,14 @@ class TreeBuilder(object):
             self.defaultNamespace = "http://www.w3.org/1999/xhtml"
         else:
             self.defaultNamespace = None
+        # Attach a WorkCounter instance here to collect linear-scan counters;
+        # None keeps the default zero-overhead behaviour.
+        self.work = None
         self.reset()
 
     def reset(self):
         self.openElements = []
-        self.activeFormattingElements = ActiveFormattingElements()
+        self.activeFormattingElements = ActiveFormattingElements(self.work)
 
         # XXX - rename these to headElement, formElement
         self.headPointer = None
@@ -206,7 +277,10 @@ class TreeBuilder(object):
 
         listElements, invert = listElementsMap[variant]
 
+        work = self.work
         for node in reversed(self.openElements):
+            if work is not None:
+                work.scope_probes += 1
             if exactNode and node == target:
                 return True
             elif not exactNode and node.nameTuple == target:
@@ -215,6 +289,108 @@ class TreeBuilder(object):
                 return False
 
         assert False  # We should never reach this point
+
+    def stackContains(self, node):
+        """Membership test for the stack of open elements.
+
+        The search runs from the top of the stack downwards: active
+        formatting elements being looked up are always currently open, so
+        they are typically close to the top. The result is identical to a
+        forward membership test.
+        """
+        work = self.work
+        stack = self.openElements
+        if work is None:
+            for item in reversed(stack):
+                if item is node:
+                    return True
+            return False
+        for item in reversed(stack):
+            work.stack_contains += 1
+            if item is node:
+                return True
+        return False
+
+    def stackIndex(self, node):
+        """Index lookup for a node known to be on the stack of open elements."""
+        index = self.stackFindIndex(node)
+        if index == -1:
+            raise ValueError("node is not in the stack of open elements")
+        return index
+
+    def stackFindIndex(self, node):
+        """Index of a node on the stack of open elements, or -1 if absent."""
+        work = self.work
+        stack = self.openElements
+        index = len(stack) - 1
+        if work is None:
+            while index >= 0:
+                if stack[index] is node:
+                    return index
+                index -= 1
+            return -1
+        while index >= 0:
+            work.stack_index += 1
+            if stack[index] is node:
+                return index
+            index -= 1
+        return -1
+
+    def stackRemove(self, node):
+        """Identity-based removal from the stack of open elements."""
+        work = self.work
+        stack = self.openElements
+        index = len(stack) - 1
+        while index >= 0:
+            if work is not None:
+                work.stack_remove += 1
+            if stack[index] is node:
+                del stack[index]
+                return
+            index -= 1
+        raise ValueError("node is not in the stack of open elements")
+
+    def activeFormattingContains(self, node):
+        """Membership test for the list of active formatting elements."""
+        work = self.work
+        for item in reversed(self.activeFormattingElements):
+            if work is not None:
+                work.afe_contains += 1
+            if item is node:
+                return True
+        return False
+
+    def activeFormattingIndex(self, node):
+        """Index lookup on the list of active formatting elements."""
+        work = self.work
+        elements = self.activeFormattingElements
+        index = len(elements) - 1
+        if work is None:
+            while index >= 0:
+                if elements[index] is node:
+                    return index
+                index -= 1
+        else:
+            while index >= 0:
+                work.afe_index += 1
+                if elements[index] is node:
+                    return index
+                index -= 1
+        raise ValueError("node is not in the list of active formatting elements")
+
+    def activeFormattingRemove(self, node):
+        """Identity-based removal from the list of active formatting elements."""
+        work = self.work
+        elements = self.activeFormattingElements
+        index = len(elements) - 1
+        while index >= 0:
+            if work is not None:
+                work.afe_remove += 1
+            if elements[index] is node:
+                del elements[index]
+                return
+            index -= 1
+        raise ValueError("node is not in the list of active formatting elements")
 
     def reconstructActiveFormattingElements(self):
         # Within this algorithm the order of steps described in the
@@ -228,11 +404,25 @@ class TreeBuilder(object):
         # Step 2 and step 3: we start with the last element. So i is -1.
         i = len(self.activeFormattingElements) - 1
         entry = self.activeFormattingElements[i]
-        if entry == Marker or entry in self.openElements:
+        if entry == Marker or self.stackContains(entry):
             return
 
+        # The stack of open elements is not mutated while walking back
+        # through the list of active formatting elements, so when more
+        # than one entry may have to be checked, one identity snapshot can
+        # answer all the membership questions instead of rescanning the
+        # stack once per entry.
+        work = self.work
+        if len(self.activeFormattingElements) > 1:
+            if work is not None:
+                work.stack_snapshot += len(self.openElements)
+            openElementsSnapshot = set(self.openElements)
+            entryOnStack = openElementsSnapshot.__contains__
+        else:
+            entryOnStack = self.stackContains
+
         # Step 6
-        while entry != Marker and entry not in self.openElements:
+        while entry != Marker and not entryOnStack(entry):
             if i == 0:
                 # This will be reset to 0 below
                 i = -1
@@ -273,6 +463,8 @@ class TreeBuilder(object):
         return false"""
 
         for item in self.activeFormattingElements[::-1]:
+            if self.work is not None:
+                self.work.afe_probes += 1
             # Check for Marker first because if it's a Marker it doesn't have a
             # name attribute.
             if item == Marker:
@@ -371,7 +563,10 @@ class TreeBuilder(object):
         lastTable = None
         fosterParent = None
         insertBefore = None
+        work = self.work
         for elm in self.openElements[::-1]:
+            if work is not None:
+                work.foster_probes += 1
             if elm.name == "table":
                 lastTable = elm
                 break
@@ -383,7 +578,7 @@ class TreeBuilder(object):
                 insertBefore = lastTable
             else:
                 fosterParent = self.openElements[
-                    self.openElements.index(lastTable) - 1]
+                    self.stackIndex(lastTable) - 1]
         else:
             fosterParent = self.openElements[0]
         return fosterParent, insertBefore

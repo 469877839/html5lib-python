@@ -16,6 +16,15 @@ Features:
 * The ``<ol reversed>`` and ``<ol start>`` attributes are now permitted by the
   sanitizer. (#321) (Thank you, Tom Most!)
 
+Performance:
+
+* Reduce repeated linear scans of the stack of open elements and the list
+  of active formatting elements during adoption agency processing, active
+  formatting reconstruction and foster parent positioning. Parse output,
+  parse-error ordering and the specification's iteration limits are
+  unchanged. An optional ``WorkCounter`` (attached via
+  ``treebuilder.work``) records element-level scan counts for benchmarks.
+
 Bug fixes:
 
 * The sanitizer now permits ``<summary>`` tags. It used to allow ``<details>``

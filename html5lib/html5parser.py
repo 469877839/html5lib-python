@@ -941,6 +941,8 @@ class InBodyPhase(Phase):
 
         matchingElements = []
         for node in self.tree.activeFormattingElements[::-1]:
+            if self.tree.work is not None:
+                self.tree.work.afe_probes += 1
             if node is Marker:
                 break
             elif self.isMatchingFormattingElement(node, element):
@@ -948,8 +950,10 @@ class InBodyPhase(Phase):
 
         assert len(matchingElements) <= 3
         if len(matchingElements) == 3:
-            self.tree.activeFormattingElements.remove(matchingElements[-1])
-        self.tree.activeFormattingElements.append(element)
+            self.tree.activeFormattingRemove(matchingElements[-1])
+        # The Noah's Ark clause check was just performed above, so the
+        # element can be appended without scanning the list again.
+        self.tree.activeFormattingElements.appendChecked(element)
 
     # the real deal
     def processEOF(self):
@@ -1082,10 +1086,10 @@ class InBodyPhase(Phase):
             self.parser.parseError("unexpected-start-tag-implies-end-tag",
                                    {"startName": "a", "endName": "a"})
             self.endTagFormatting(impliedTagToken("a"))
-            if afeAElement in self.tree.openElements:
-                self.tree.openElements.remove(afeAElement)
-            if afeAElement in self.tree.activeFormattingElements:
-                self.tree.activeFormattingElements.remove(afeAElement)
+            if self.tree.stackContains(afeAElement):
+                self.tree.stackRemove(afeAElement)
+            if self.tree.activeFormattingContains(afeAElement):
+                self.tree.activeFormattingRemove(afeAElement)
         self.tree.reconstructActiveFormattingElements()
         self.addFormattingElement(token)
 
@@ -1406,12 +1410,26 @@ class InBodyPhase(Phase):
             # - has the same tag name as the token.
             formattingElement = self.tree.elementInActiveFormattingElements(
                 token["name"])
-            if (not formattingElement or
-                (formattingElement in self.tree.openElements and
-                 not self.tree.elementInScope(formattingElement.name))):
+            if not formattingElement:
                 # If there is no such node, then abort these steps
                 # and instead act as described in the "any other
                 # end tag" entry below.
+                self.endTagOther(token)
+                return
+
+            # Locate the formatting element on the stack of open elements
+            # once; the position is reused in step 5 as the furthest block
+            # anchor, so no second stack walk is needed.
+            afeIndex = self.tree.stackFindIndex(formattingElement)
+            if afeIndex != -1:
+                feInScope = self.tree.elementInScope(formattingElement.name)
+            else:
+                feInScope = False
+
+            if afeIndex != -1 and not feInScope:
+                # The element is on the stack but is not in scope: abort
+                # these steps and instead act as described in the "any
+                # other end tag" entry below.
                 self.endTagOther(token)
                 return
 
@@ -1419,16 +1437,16 @@ class InBodyPhase(Phase):
             # not in the stack of open elements, then this is a
             # parse error; remove the element from the list, and
             # abort these steps.
-            elif formattingElement not in self.tree.openElements:
+            elif afeIndex == -1:
                 self.parser.parseError("adoption-agency-1.2", {"name": token["name"]})
-                self.tree.activeFormattingElements.remove(formattingElement)
+                self.tree.activeFormattingRemove(formattingElement)
                 return
 
             # Otherwise, if there is such a node, and that node is
             # also in the stack of open elements, but the element
             # is not in scope, then this is a parse error; ignore
             # the token, and abort these steps.
-            elif not self.tree.elementInScope(formattingElement.name):
+            elif not feInScope:
                 self.parser.parseError("adoption-agency-4.4", {"name": token["name"]})
                 return
 
@@ -1447,11 +1465,15 @@ class InBodyPhase(Phase):
             # stack of open elements that is lower in the stack
             # than the formatting element, and is an element in
             # the special category. There might not be one.
-            afeIndex = self.tree.openElements.index(formattingElement)
+            # afeIndex was computed once in step 4; the stack is not
+            # mutated between step 4 and this point.
             furthestBlock = None
-            for element in self.tree.openElements[afeIndex:]:
+            for offset, element in enumerate(self.tree.openElements[afeIndex:]):
+                if self.tree.work is not None:
+                    self.tree.work.agency_probes += 1
                 if element.nameTuple in specialElements:
                     furthestBlock = element
+                    furthestIndex = afeIndex + offset
                     break
 
             # Step 6:
@@ -1466,7 +1488,7 @@ class InBodyPhase(Phase):
                 element = self.tree.openElements.pop()
                 while element != formattingElement:
                     element = self.tree.openElements.pop()
-                self.tree.activeFormattingElements.remove(element)
+                self.tree.activeFormattingRemove(element)
                 return
 
             # Step 7
@@ -1477,34 +1499,37 @@ class InBodyPhase(Phase):
             # nodes in step 15. We have to ensure that we reinsert nodes after
             # the node before the active formatting element. Note the bookmark
             # can move in step 9.7
-            bookmark = self.tree.activeFormattingElements.index(formattingElement)
+            bookmark = self.tree.activeFormattingIndex(formattingElement)
 
             # Step 9
             lastNode = node = furthestBlock
             innerLoopCounter = 0
 
-            index = self.tree.openElements.index(node)
+            # furthestIndex was recorded in step 5; only removals before it
+            # (which shift the index down) have happened since, so keep it
+            # in sync manually instead of rescanning the stack.
+            index = furthestIndex
             while innerLoopCounter < 3:
                 innerLoopCounter += 1
                 # Node is element before node in open elements
                 index -= 1
                 node = self.tree.openElements[index]
-                if node not in self.tree.activeFormattingElements:
-                    self.tree.openElements.remove(node)
+                if not self.tree.activeFormattingContains(node):
+                    self.tree.stackRemove(node)
+                    furthestIndex -= 1
                     continue
                 # Step 9.6
                 if node == formattingElement:
                     break
                 # Step 9.7
+                afeNodeIndex = self.tree.activeFormattingIndex(node)
                 if lastNode == furthestBlock:
-                    bookmark = self.tree.activeFormattingElements.index(node) + 1
+                    bookmark = afeNodeIndex + 1
                 # Step 9.8
                 clone = node.cloneNode()
                 # Replace node with clone
-                self.tree.activeFormattingElements[
-                    self.tree.activeFormattingElements.index(node)] = clone
-                self.tree.openElements[
-                    self.tree.openElements.index(node)] = clone
+                self.tree.activeFormattingElements[afeNodeIndex] = clone
+                self.tree.openElements[index] = clone
                 node = clone
                 # Step 9.9
                 # Remove lastNode from its parents, if any
@@ -1537,13 +1562,13 @@ class InBodyPhase(Phase):
             furthestBlock.appendChild(clone)
 
             # Step 14
-            self.tree.activeFormattingElements.remove(formattingElement)
+            self.tree.activeFormattingRemove(formattingElement)
             self.tree.activeFormattingElements.insert(bookmark, clone)
 
             # Step 15
-            self.tree.openElements.remove(formattingElement)
-            self.tree.openElements.insert(
-                self.tree.openElements.index(furthestBlock) + 1, clone)
+            self.tree.stackRemove(formattingElement)
+            furthestIndex -= 1
+            self.tree.openElements.insert(furthestIndex + 1, clone)
 
     def endTagAppletMarqueeObject(self, token):
         if self.tree.elementInScope(token["name"]):
