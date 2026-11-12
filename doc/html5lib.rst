@@ -19,6 +19,18 @@ html5lib Package
     :show-inheritance:
     :special-members: __init__
 
+``mutation`` Module
+-------------------
+
+The optional tree mutation observer reports every structural change
+(creation, insertion, move, text append, attribute update and removal), with
+stable per-parse node ids and an explicit reset boundary for encoding driven
+reparses.  See the module docstring for the full event semantics.
+
+.. automodule:: html5lib.mutation
+    :members:
+    :show-inheritance:
+
 ``serializer`` Module
 ---------------------
 

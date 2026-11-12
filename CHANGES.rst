@@ -8,6 +8,14 @@ Unreleased yet
 
 Features:
 
+* Add an optional tree mutation observer (``mutationObserver`` keyword on
+  :class:`~html5lib.html5parser.HTMLParser` and the treebuilders).  It
+  reports ordered ``create``, ``insert``, ``move``, ``text``, ``attribute``,
+  ``remove`` and ``reset`` events with stable per-parse node ids, including
+  foster parenting, active formatting element reconstruction, fragment
+  roots and text/tail merging; an explicit ``reset`` event separates trees
+  when an encoding change forces a reparse.  No event log is kept when no
+  observer is supplied.  See :mod:`html5lib.mutation`.
 * Add support for the ``<wbr>`` element in the sanitizer, `which indicates
   a line break opportunity <https://html.spec.whatwg.org/#the-wbr-element>`_.
   This element is allowed by default. (#395) (Thank you, Tom Most!)

@@ -64,6 +64,10 @@ def getDomBuilder(DomImplementation):
         def appendChild(self, node):
             node.parent = self
             self.element.appendChild(node.element)
+            # Keep the wrapper-level child list in sync so code that relies on
+            # ``node.childNodes`` (including mutation observation) works on
+            # DOM backends.
+            self.childNodes.append(node)
 
         def insertText(self, data, insertBefore=None):
             text = self.element.ownerDocument.createTextNode(data)
@@ -73,20 +77,31 @@ def getDomBuilder(DomImplementation):
                 self.element.appendChild(text)
 
         def insertBefore(self, node, refNode):
+            index = self.childNodes.index(refNode)
             self.element.insertBefore(node.element, refNode.element)
+            self.childNodes.insert(index, node)
             node.parent = self
 
         def removeChild(self, node):
             if node.element.parentNode == self.element:
                 self.element.removeChild(node.element)
+            if node in self.childNodes:
+                self.childNodes.remove(node)
             node.parent = None
 
         def reparentChildren(self, newParent):
+            # Keep the wrapper-level child list in lock-step with the DOM
+            # operations below: element wrappers move too, text nodes are
+            # only present in the raw DOM.
+            moved_wrappers = list(self.childNodes)
+            for wrapper in moved_wrappers:
+                wrapper.parent = newParent
+            newParent.childNodes.extend(moved_wrappers)
+            self.childNodes = []
             while self.element.hasChildNodes():
                 child = self.element.firstChild
                 self.element.removeChild(child)
                 newParent.element.appendChild(child)
-            self.childNodes = []
 
         def getAttributes(self):
             return AttrList(self.element)
@@ -132,7 +147,17 @@ def getDomBuilder(DomImplementation):
 
             domimpl = Dom.getDOMImplementation()
             doctype = domimpl.createDocumentType(name, publicId, systemId)
-            self.document.appendChild(NodeBuilder(doctype))
+            node = NodeBuilder(doctype)
+            node._mutation_kind = "doctype"
+            if self.recorder is not None:
+                attributes = {}
+                if publicId:
+                    attributes["publicId"] = publicId
+                if systemId:
+                    attributes["systemId"] = systemId
+                self.recorder.create(node, kind="doctype", name=name,
+                                     attributes=attributes)
+            self._observeInsert(self.document, node)
             if Dom == minidom:
                 doctype.ownerDocument = self.dom
 

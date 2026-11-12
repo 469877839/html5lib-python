@@ -40,7 +40,8 @@ def parse(doc, treebuilder="etree", namespaceHTMLElements=True, **kwargs):
 
     """
     tb = treebuilders.getTreeBuilder(treebuilder)
-    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements)
+    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements,
+                   mutationObserver=kwargs.pop("mutationObserver", None))
     return p.parse(doc, **kwargs)
 
 
@@ -65,7 +66,8 @@ def parseFragment(doc, container="div", treebuilder="etree", namespaceHTMLElemen
 
     """
     tb = treebuilders.getTreeBuilder(treebuilder)
-    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements)
+    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements,
+                   mutationObserver=kwargs.pop("mutationObserver", None))
     return p.parseFragment(doc, container=container, **kwargs)
 
 
@@ -76,7 +78,8 @@ class HTMLParser(object):
 
     """
 
-    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True, debug=False):
+    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True,
+                 debug=False, mutationObserver=None):
         """
         :arg tree: a treebuilder class controlling the type of tree that will be
             returned. Built in treebuilders can be accessed through
@@ -105,7 +108,13 @@ class HTMLParser(object):
         elif isinstance(tree, str):
             tree = treebuilders.getTreeBuilder(tree)
 
-        self.tree = tree(namespaceHTMLElements)
+        self.mutationObserver = mutationObserver
+        try:
+            self.tree = tree(namespaceHTMLElements,
+                             mutationObserver=mutationObserver)
+        except TypeError:
+            # Third party treebuilders may not accept the keyword argument.
+            self.tree = tree(namespaceHTMLElements)
         self.errors = []
 
         self.phases = {name: cls(self, self.tree) for name, cls in
@@ -121,12 +130,19 @@ class HTMLParser(object):
 
         try:
             self.mainLoop()
-        except _ReparseException:
-            self.reset()
+        except _ReparseException as exc:
+            # The encoding changed: everything built so far is discarded and
+            # the whole input is parsed again.  The treebuilder reset emits a
+            # MUTATION_RESET event so observers never merge the two trees.
+            self.reset(reason="encoding-reparse: %s" % exc)
             self.mainLoop()
 
-    def reset(self):
-        self.tree.reset()
+    def reset(self, reason="parser-reset"):
+        if self.mutationObserver is not None and \
+                getattr(self.tree, "recorder", None) is not None:
+            self.tree.reset(reason=reason)
+        else:
+            self.tree.reset()
         self.firstStartTag = False
         self.errors = []
         self.log = []  # only used with debug mode
@@ -450,6 +466,9 @@ class Phase(object):
         for attr, value in token["data"].items():
             if attr not in self.tree.openElements[0].attributes:
                 self.tree.openElements[0].attributes[attr] = value
+                if self.tree.recorder is not None:
+                    self.tree.recorder.attribute(
+                        self.tree.openElements[0], attr, value)
         self.parser.firstStartTag = False
 
     def processEndTag(self, token):
@@ -1004,6 +1023,9 @@ class InBodyPhase(Phase):
             for attr, value in token["data"].items():
                 if attr not in self.tree.openElements[1].attributes:
                     self.tree.openElements[1].attributes[attr] = value
+                    if self.tree.recorder is not None:
+                        self.tree.recorder.attribute(
+                            self.tree.openElements[1], attr, value)
 
     def startTagFrameset(self, token):
         self.parser.parseError("unexpected-start-tag", {"name": "frameset"})
@@ -1013,7 +1035,9 @@ class InBodyPhase(Phase):
             pass
         else:
             if self.tree.openElements[1].parent:
-                self.tree.openElements[1].parent.removeChild(self.tree.openElements[1])
+                self.tree._observeRemove(
+                    self.tree.openElements[1].parent,
+                    self.tree.openElements[1])
             while self.tree.openElements[-1].name != "html":
                 self.tree.openElements.pop()
             self.tree.insertElement(token)
@@ -1499,7 +1523,7 @@ class InBodyPhase(Phase):
                 if lastNode == furthestBlock:
                     bookmark = self.tree.activeFormattingElements.index(node) + 1
                 # Step 9.8
-                clone = node.cloneNode()
+                clone = self.tree._observeClone(node)
                 # Replace node with clone
                 self.tree.activeFormattingElements[
                     self.tree.activeFormattingElements.index(node)] = clone
@@ -1507,10 +1531,8 @@ class InBodyPhase(Phase):
                     self.tree.openElements.index(node)] = clone
                 node = clone
                 # Step 9.9
-                # Remove lastNode from its parents, if any
-                if lastNode.parent:
-                    lastNode.parent.removeChild(lastNode)
-                node.appendChild(lastNode)
+                # Move lastNode under the clone, if it had a parent
+                self.tree._observeMove(node, lastNode)
                 # Step 9.10
                 lastNode = node
 
@@ -1518,17 +1540,18 @@ class InBodyPhase(Phase):
             # Foster parent lastNode if commonAncestor is a
             # table, tbody, tfoot, thead, or tr we need to foster
             # parent the lastNode
-            if lastNode.parent:
-                lastNode.parent.removeChild(lastNode)
+            oldParent = lastNode.parent
 
             if commonAncestor.name in frozenset(("table", "tbody", "tfoot", "thead", "tr")):
                 parent, insertBefore = self.tree.getTableMisnestedNodePosition()
-                parent.insertBefore(lastNode, insertBefore)
+                self.tree._observeMove(parent, lastNode, before=insertBefore,
+                                       old_parent=oldParent)
             else:
-                commonAncestor.appendChild(lastNode)
+                self.tree._observeMove(commonAncestor, lastNode,
+                                       old_parent=oldParent)
 
             # Step 11
-            clone = formattingElement.cloneNode()
+            clone = self.tree._observeClone(formattingElement)
 
             # Step 12
             furthestBlock.reparentChildren(clone)

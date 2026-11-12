@@ -190,7 +190,8 @@ class TreeBuilder(base.TreeBuilder):
     fragmentClass = Document
     implementation = etree
 
-    def __init__(self, namespaceHTMLElements, fullTree=False):
+    def __init__(self, namespaceHTMLElements, fullTree=False,
+                 mutationObserver=None):
         builder = etree_builders.getETreeModule(etree, fullTree=fullTree)
         infosetFilter = self.infosetFilter = _ihatexml.InfosetFilter(preventDoubleDashComments=True)
         self.namespaceHTMLElements = namespaceHTMLElements
@@ -280,10 +281,11 @@ class TreeBuilder(base.TreeBuilder):
         self.elementClass = Element
         self.commentClass = Comment
         # self.fragmentClass = builder.DocumentFragment
-        base.TreeBuilder.__init__(self, namespaceHTMLElements)
+        base.TreeBuilder.__init__(self, namespaceHTMLElements,
+                                  mutationObserver=mutationObserver)
 
-    def reset(self):
-        base.TreeBuilder.reset(self)
+    def reset(self, reason="parser-reset"):
+        base.TreeBuilder.reset(self, reason=reason)
         self.insertComment = self.insertCommentInitial
         self.initial_comments = []
         self.doctype = None

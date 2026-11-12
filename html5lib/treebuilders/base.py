@@ -2,6 +2,7 @@ from __future__ import absolute_import, division, unicode_literals
 from six import text_type
 
 from ..constants import scopingElements, tableInsertModeElements, namespaces
+from .. import mutation
 
 # The scope markers are inserted when entering object elements,
 # marquees, table cells, and table captions, and are used to prevent formatting
@@ -18,6 +19,28 @@ listElementsMap = {
     "select": (frozenset([(namespaces["html"], "optgroup"),
                           (namespaces["html"], "option")]), True)
 }
+
+
+def _leadingText(node):
+    """Return the leading text of a node in a backend-independent way.
+
+    etree-style backends store it as ``_element.text``; DOM-style backends
+    keep it as a leading text child node.
+    """
+    element = getattr(node, "_element", None)
+    if element is not None:
+        return getattr(element, "text", None)
+    dom_element = getattr(node, "element", None)
+    if dom_element is not None:
+        # DOM backends keep every text insert as a separate text node, so the
+        # leading text may span several consecutive nodes.
+        parts = []
+        for child in dom_element.childNodes:
+            if child.nodeType != child.TEXT_NODE:
+                break
+            parts.append(child.nodeValue or "")
+        return "".join(parts) or None
+    return None
 
 
 class Node(object):
@@ -170,19 +193,29 @@ class TreeBuilder(object):
     # Fragment class
     fragmentClass = None
 
-    def __init__(self, namespaceHTMLElements):
+    def __init__(self, namespaceHTMLElements, mutationObserver=None):
         """Create a TreeBuilder
 
         :arg namespaceHTMLElements: whether or not to namespace HTML elements
+
+        :arg mutationObserver: an optional object implementing the
+            :class:`html5lib.mutation.TreeMutationObserver` protocol.  When
+            given, every structural change is reported to it; when omitted
+            no event log is kept and the mutation code paths are not
+            installed.
 
         """
         if namespaceHTMLElements:
             self.defaultNamespace = "http://www.w3.org/1999/xhtml"
         else:
             self.defaultNamespace = None
+        self.mutationObserver = mutationObserver
+        self.recorder = mutation.MutationRecorder(mutationObserver) \
+            if mutationObserver is not None else None
+        self._wrapMutationMethods()
         self.reset()
 
-    def reset(self):
+    def reset(self, reason="parser-reset"):
         self.openElements = []
         self.activeFormattingElements = ActiveFormattingElements()
 
@@ -193,6 +226,10 @@ class TreeBuilder(object):
         self.insertFromTable = False
 
         self.document = self.documentClass()
+        if self.recorder is not None:
+            self.recorder.reset(reason=reason)
+            self.document._mutation_kind = "document"
+            self.recorder.create(self.document)
 
     def elementInScope(self, target, variant=None):
 
@@ -247,7 +284,7 @@ class TreeBuilder(object):
 
             # Step 8
             entry = self.activeFormattingElements[i]
-            clone = entry.cloneNode()  # Mainly to get a new copy of the attributes
+            clone = self._observeClone(entry)  # New copy of the attributes
 
             # Step 9
             element = self.insertElement({"type": "StartTag",
@@ -284,7 +321,7 @@ class TreeBuilder(object):
     def insertRoot(self, token):
         element = self.createElement(token)
         self.openElements.append(element)
-        self.document.appendChild(element)
+        self._observeInsert(self.document, element)
 
     def insertDoctype(self, token):
         name = token["name"]
@@ -292,12 +329,25 @@ class TreeBuilder(object):
         systemId = token["systemId"]
 
         doctype = self.doctypeClass(name, publicId, systemId)
-        self.document.appendChild(doctype)
+        if self.recorder is not None:
+            doctype._mutation_kind = "doctype"
+            attributes = {}
+            if publicId:
+                attributes["publicId"] = publicId
+            if systemId:
+                attributes["systemId"] = systemId
+            self.recorder.create(doctype, kind="doctype", name=name,
+                                 attributes=attributes)
+        self._observeInsert(self.document, doctype)
 
     def insertComment(self, token, parent=None):
         if parent is None:
             parent = self.openElements[-1]
-        parent.appendChild(self.commentClass(token["data"]))
+        comment = self.commentClass(token["data"])
+        if self.recorder is not None:
+            comment._mutation_kind = "comment"
+            self.recorder.create(comment, kind="comment", text=token["data"])
+        self._observeInsert(parent, comment)
 
     def createElement(self, token):
         """Create an element but don't insert it anywhere"""
@@ -305,6 +355,9 @@ class TreeBuilder(object):
         namespace = token.get("namespace", self.defaultNamespace)
         element = self.elementClass(name, namespace)
         element.attributes = token["data"]
+        element._mutation_kind = "element"
+        if self.recorder is not None:
+            self.recorder.create(element)
         return element
 
     def _getInsertFromTable(self):
@@ -327,7 +380,10 @@ class TreeBuilder(object):
         namespace = token.get("namespace", self.defaultNamespace)
         element = self.elementClass(name, namespace)
         element.attributes = token["data"]
-        self.openElements[-1].appendChild(element)
+        element._mutation_kind = "element"
+        if self.recorder is not None:
+            self.recorder.create(element)
+        self._observeInsert(self.openElements[-1], element)
         self.openElements.append(element)
         return element
 
@@ -340,10 +396,7 @@ class TreeBuilder(object):
             # We should be in the InTable mode. This means we want to do
             # special magic element rearranging
             parent, insertBefore = self.getTableMisnestedNodePosition()
-            if insertBefore is None:
-                parent.appendChild(element)
-            else:
-                parent.insertBefore(element, insertBefore)
+            self._observeInsert(parent, element, before=insertBefore)
             self.openElements.append(element)
         return element
 
@@ -355,12 +408,24 @@ class TreeBuilder(object):
         if (not self.insertFromTable or (self.insertFromTable and
                                          self.openElements[-1].name
                                          not in tableInsertModeElements)):
-            parent.insertText(data)
+            # When the container already has children, etree-style backends
+            # merge the data into the last child's tail rather than the
+            # container's own text, so compute the same anchor for the event.
+            anchor = parent.childNodes[-1] if parent.childNodes else None
+            if self.recorder is not None:
+                self.recorder.text(parent, data, before=anchor)
+                self.recorder._suspend = True
+                try:
+                    parent.insertText(data)
+                finally:
+                    self.recorder._suspend = False
+            else:
+                parent.insertText(data)
         else:
             # We should be in the InTable mode. This means we want to do
             # special magic element rearranging
             parent, insertBefore = self.getTableMisnestedNodePosition()
-            parent.insertText(data, insertBefore)
+            self._observeText(parent, data, insertBefore=insertBefore)
 
     def getTableMisnestedNodePosition(self):
         """Get the foster parent element, and sibling to insert before
@@ -406,8 +471,233 @@ class TreeBuilder(object):
         """Return the final fragment"""
         # assert self.innerHTML
         fragment = self.fragmentClass()
+        fragment._mutation_kind = "fragment"
+        if self.recorder is not None:
+            self.recorder.create(fragment)
+        # reparentChildren is wrapped when observing, so every child moved
+        # into the fragment root is reported as an insert into it.
         self.openElements[0].reparentChildren(fragment)
         return fragment
+
+    # -- Mutation observation -------------------------------------------------
+    #
+    # Every structural change goes through one of the helpers below.  When no
+    # observer was supplied the ``recorder`` attribute is None and the
+    # wrappers installed by ``_wrapMutationMethods`` forward straight to the
+    # original node methods, so an unobserved parse does not keep an event
+    # log or even allocate event objects.
+
+    def _wrapMutationMethods(self):
+        if self.recorder is None:
+            return
+        recorder = self.recorder
+
+        def wrapNode(node):
+            if getattr(node, "_mutation_wrapped", False):
+                return
+            # Methods are installed per node instance, so a different
+            # TreeBuilder (observed or not) never sees these wrappers.
+            try:
+                node._mutation_wrapped = True
+            except (AttributeError, TypeError):
+                return
+            for methodName in ("appendChild", "insertBefore", "removeChild",
+                               "insertText", "reparentChildren"):
+                original = getattr(type(node), methodName, None)
+                if original is None:
+                    continue
+
+                def makeWrapper(node=node, original=original,
+                                methodName=methodName):
+                    # Installed as an instance attribute, so this is not a
+                    # bound method: ``node`` comes from the closure.
+                    def wrapper(*args, **kwargs):
+                        if recorder._suspend:
+                            return original(node, *args, **kwargs)
+                        if methodName == "appendChild":
+                            child = args[0]
+                            if getattr(child, "parent", None) is not None:
+                                siblings = child.parent.childNodes
+                                index = siblings.index(child) \
+                                    if child in siblings else None
+                                old_before = siblings[index + 1] \
+                                    if index is not None and \
+                                    index + 1 < len(siblings) else None
+                                recorder.insert(child, node, move=True,
+                                                old_parent=child.parent,
+                                                old_before=old_before)
+                            else:
+                                recorder.insert(child, node)
+                        elif methodName == "insertBefore":
+                            child = args[0]
+                            if getattr(child, "parent", None) is not None:
+                                siblings = child.parent.childNodes
+                                index = siblings.index(child) \
+                                    if child in siblings else None
+                                old_before = siblings[index + 1] \
+                                    if index is not None and \
+                                    index + 1 < len(siblings) else None
+                                recorder.insert(child, node, before=args[1],
+                                                move=True,
+                                                old_parent=child.parent,
+                                                old_before=old_before)
+                            else:
+                                recorder.insert(child, node, before=args[1])
+                        elif methodName == "removeChild":
+                            recorder.remove(args[0], node)
+                        elif methodName == "insertText":
+                            insertBefore = args[1] if len(args) > 1 else None
+                            # Anchor the text to the child whose tail it is
+                            # merged into (None = the container's own text).
+                            if insertBefore is None:
+                                anchor = (node.childNodes[-1]
+                                          if node.childNodes else None)
+                            else:
+                                index = node.childNodes.index(insertBefore)
+                                anchor = (node.childNodes[index - 1]
+                                          if index > 0 else None)
+                            recorder.text(node, args[0], before=anchor)
+                        elif methodName == "reparentChildren":
+                            new_parent = args[0]
+                            # Only the leading text has to be reported as a
+                            # move: tails travel with the child elements that
+                            # are moved, and the original performs that move.
+                            leading_text = _leadingText(node)
+                            if leading_text:
+                                anchor = (new_parent.childNodes[-1]
+                                          if new_parent.childNodes else None)
+                                recorder.text(new_parent, leading_text,
+                                              before=anchor, moved_from=node)
+                            for child in list(node.childNodes):
+                                recorder.insert(child, new_parent)
+                            # The original reparents the children itself; make
+                            # sure the nested node mutations stay silent.
+                            recorder._suspend = True
+                            try:
+                                return original(node, *args, **kwargs)
+                            finally:
+                                recorder._suspend = False
+                        return original(node, *args, **kwargs)
+
+                    wrapper.__name__ = methodName
+                    return wrapper
+
+                try:
+                    setattr(node, methodName, makeWrapper())
+                except (AttributeError, TypeError):
+                    # Backends that do not allow per-instance attributes must
+                    # go through the TreeBuilder helpers instead.
+                    pass
+
+        recorder._node_wrapper = wrapNode
+
+    def _observeInsert(self, parent, node, before=None):
+        """Emit an insert (or move) event and perform the real insertion."""
+        if self.recorder is not None and getattr(node, "parent", None) is not None:
+            return self._observeMove(parent, node, before=before)
+        if self.recorder is not None:
+            self.recorder.insert(node, parent, before=before)
+            self.recorder._suspend = True
+            try:
+                if before is None:
+                    parent.appendChild(node)
+                else:
+                    parent.insertBefore(node, before)
+            finally:
+                self.recorder._suspend = False
+        elif before is None:
+            parent.appendChild(node)
+        else:
+            parent.insertBefore(node, before)
+
+    def _observeMove(self, parent, node, before=None, old_parent=None,
+                     old_before=None):
+        """Report and perform a reparent operation as a single move event."""
+        if old_parent is None:
+            old_parent = getattr(node, "parent", None)
+        if old_parent is None:
+            return self._observeInsert(parent, node, before=before)
+        siblings = getattr(old_parent, "childNodes", [])
+        if old_parent is parent:
+            if before is None:
+                if siblings and siblings[-1] is node:
+                    # Already in place; the remove/append would be a no-op.
+                    return
+            elif node in siblings and before in siblings and \
+                    siblings.index(node) == siblings.index(before) - 1:
+                # Already directly before the reference sibling.
+                return
+        if self.recorder is not None:
+            if old_before is None:
+                siblings = getattr(old_parent, "childNodes", [])
+                index = siblings.index(node) if node in siblings else None
+                if index is not None and index + 1 < len(siblings):
+                    old_before = siblings[index + 1]
+            self.recorder.insert(node, parent, before=before, move=True,
+                                 old_parent=old_parent,
+                                 old_before=old_before)
+            self.recorder._suspend = True
+            try:
+                if node in getattr(old_parent, "childNodes", []):
+                    old_parent.removeChild(node)
+                if before is None:
+                    parent.appendChild(node)
+                else:
+                    parent.insertBefore(node, before)
+            finally:
+                self.recorder._suspend = False
+        else:
+            if node in getattr(old_parent, "childNodes", []):
+                old_parent.removeChild(node)
+            if before is None:
+                parent.appendChild(node)
+            else:
+                parent.insertBefore(node, before)
+
+    def _observeRemove(self, parent, node):
+        if self.recorder is not None:
+            self.recorder.remove(node, parent)
+            self.recorder._suspend = True
+            try:
+                parent.removeChild(node)
+            finally:
+                self.recorder._suspend = False
+        else:
+            parent.removeChild(node)
+
+    def _observeText(self, parent, data, insertBefore=None):
+        """Insert text into ``parent`` before ``insertBefore``.
+
+        The event anchor is the child whose tail receives the data; when the
+        text lands before the first child (or the parent has no children) it
+        becomes the parent's own leading text.
+        """
+        anchor = None
+        if insertBefore is not None:
+            siblings = parent.childNodes
+            index = siblings.index(insertBefore)
+            if index > 0:
+                anchor = siblings[index - 1]
+        elif parent.childNodes:
+            anchor = parent.childNodes[-1]
+        if self.recorder is not None:
+            self.recorder.text(parent, data, before=anchor)
+            self.recorder._suspend = True
+            try:
+                parent.insertText(data, insertBefore)
+            finally:
+                self.recorder._suspend = False
+        else:
+            parent.insertText(data, insertBefore)
+
+    def _observeClone(self, node):
+        """Clone ``node`` and report the clone as a new logical node."""
+        clone = node.cloneNode()
+        clone._mutation_kind = "element"
+        if self.recorder is not None:
+            original_id = self.recorder.node_id(node)
+            self.recorder.create(clone, clone_of=original_id)
+        return clone
 
     def testSerializer(self, node):
         """Serialize the subtree of node in the format required by unit tests
